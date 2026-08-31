@@ -1,0 +1,4 @@
+# Tested with Python 3.10-3.13 on Windows and Raspberry Pi OS (Bookworm).
+opencv-python>=4.8
+onnxruntime>=1.16
+numpy>=1.24

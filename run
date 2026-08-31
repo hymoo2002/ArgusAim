@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Run ArgusAim with the right Python, from any directory.
+#
+# On Raspberry Pi OS the system Python cannot have onnxruntime installed into it
+# (Bookworm blocks that, PEP 668), so everything lives in a virtualenv. Calling
+# plain "python main.py" there fails with ModuleNotFoundError: onnxruntime.
+# This script finds the venv so you do not have to remember where it is.
+#
+#   ./run                        vision only
+#   ./run --stream 8080          plus a browser view
+#   ./run --turret --stream 8080 plus the pan/tilt servos
+cd "$(dirname "$(readlink -f "$0")")"
+
+for candidate in .venv/bin/python "$HOME/ArgusAim/.venv/bin/python"; do
+    if [ -x "$candidate" ]; then
+        exec "$candidate" main.py "$@"
+    fi
+done
+exec python3 main.py "$@"
