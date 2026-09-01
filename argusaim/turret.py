@@ -196,6 +196,52 @@ class SimulatedPWM:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Fire output (laser module, relay, LED - anything switched by one GPIO pin)
+# ---------------------------------------------------------------------------
+LASER_GPIO = 17           # BCM numbering; physical pin 11
+
+
+class LaserOutput:
+    """One GPIO pin, on while the turret is locked on and armed.
+
+    A GPIO pin can safely source about 16 mA and most laser modules want more,
+    so drive the module through its own TTL input, or through a transistor -
+    not straight off the pin.
+    """
+
+    def __init__(self, gpio: int = LASER_GPIO, backend: str = "auto"):
+        self.gpio = gpio
+        self.is_on = False
+        self.backend = "simulated"
+        self._dev = None
+        if backend != "sim":
+            try:
+                from gpiozero import DigitalOutputDevice
+                self._dev = DigitalOutputDevice(gpio, initial_value=False)
+                self.backend = "GPIO%d" % gpio
+            except Exception as exc:
+                if backend == "hardware":
+                    raise
+                print("  [laser] no GPIO (%s) -- simulating." % exc)
+
+    def set(self, on: bool) -> None:
+        on = bool(on)
+        if on == self.is_on:
+            return                      # only touch the pin when it changes
+        self.is_on = on
+        if self._dev is not None:
+            self._dev.on() if on else self._dev.off()
+
+    def close(self) -> None:
+        try:
+            self.set(False)
+            if self._dev is not None:
+                self._dev.close()
+        except Exception:
+            pass                        # teardown is best-effort by design
+
+
 def make_backend(kind: str = "auto"):
     if kind == "sim":
         return SimulatedPWM()
@@ -215,10 +261,15 @@ class Turret:
     """Two servos, each closing the loop on its own axis."""
 
     def __init__(self, backend=None, pan: Axis = PAN, tilt: Axis = TILT,
-                 scan: Scan | None = None):
+                 scan: Scan | None = None, laser: "LaserOutput | None" = None):
         self.backend = backend if backend is not None else make_backend()
         self.pan, self.tilt = pan, tilt
         self.scan = scan if scan is not None else Scan()
+        self.laser = laser if laser is not None else LaserOutput()
+        # ARMED is a plain latch. It stays on until it is switched off, and it
+        # is the only thing standing between "locked on" and a live output.
+        self.armed = False
+        self.firing = False
         self.pan_deg = 0.0          # where we have commanded each axis to be
         self.tilt_deg = 0.0
         self.at_limit = False
@@ -242,19 +293,34 @@ class Turret:
         self.pan_deg = self._write(self.pan, 0.0)
         self.tilt_deg = self._write(self.tilt, 0.0)
 
-    def update(self, yaw: float | None, pitch: float | None, dt: float) -> None:
+    def toggle_arm(self) -> bool:
+        """Flip between SAFE and ACTION. Returns the new state."""
+        self.armed = not self.armed
+        if not self.armed:
+            self.firing = False
+            self.laser.set(False)       # never leave the output live
+        return self.armed
+
+    def update(self, yaw: float | None, pitch: float | None, dt: float,
+               on_target: bool = False) -> None:
         """One control tick. Angles are the offsets reported by the tracker.
 
         Because the camera moves with the mount, the error and the correction
         are the same quantity -- so the yaw error is simply added to the pan
         command, scaled by the gain and the time since the last tick.
+
+        The fire output follows one rule: armed AND locked on. Nothing else can
+        switch it on, and losing the target switches it off on the same tick.
         """
         dt = max(0.0, min(dt, MAX_DT))
         now = time.perf_counter()
 
         if yaw is None or pitch is None:
+            self._fire(False)           # nobody there -> output off
             self._search(now, dt)
             return
+
+        self._fire(on_target)
 
         self._last_seen = now
         self.scanning = False
@@ -295,13 +361,22 @@ class Turret:
             self._dwell_until = now + self.scan.dwell_s
         self.pan_deg = self._write(self.pan, nxt)
 
+    def _fire(self, on_target: bool) -> None:
+        self.firing = bool(self.armed and on_target)
+        self.laser.set(self.firing)
+
     def release(self) -> None:
         """Stop driving the servos so they go limp instead of buzzing."""
         for axis in (self.pan, self.tilt):
             self.backend.set_pulse_us(axis.channel, 0)
 
     def close(self) -> None:
+        # The output goes off first and unconditionally: whatever else fails on
+        # the way down, the laser must not be left lit.
         try:
-            self.release()
+            self.laser.close()
         finally:
-            self.backend.close()
+            try:
+                self.release()
+            finally:
+                self.backend.close()

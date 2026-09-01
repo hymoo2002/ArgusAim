@@ -33,9 +33,54 @@ PAGE = """<!doctype html><html><head><title>ArgusAim</title>
       justify-content:center;min-height:100vh;gap:12px}
  img{max-width:96vw;height:auto;border:1px solid #333;border-radius:4px}
  p{font-size:13px;color:#666;margin:0}
+ .bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+      justify-content:center}
+ button{font-family:inherit;font-size:15px;font-weight:600;letter-spacing:1px;
+        padding:10px 22px;border-radius:6px;cursor:pointer;
+        background:#1d3a1d;border:2px solid #3d7a3d;color:#cfc}
+ button.armed{background:#c02020;border-color:#ff6060;color:#fff}
+ .pill{padding:4px 11px;border-radius:11px;border:1px solid #333;
+       font-size:12px;color:#888;font-variant-numeric:tabular-nums}
+ .pill.hot{color:#f77;border-color:#7a3030;background:#2a1010}
+ .pill.live{color:#6d6;border-color:#3a5a3a}
 </style></head><body>
 <img src="/stream.mjpg" alt="ArgusAim live view">
-<p>ArgusAim &mdash; live view</p>
+<div class="bar">
+  <button id="arm" onclick="toggleArm()">SAFE</button>
+  <span class="pill" id="fire">output off</span>
+  <span class="pill" id="pos">pan --  tilt --</span>
+</div>
+<p>ArgusAim &mdash; live view &nbsp;|&nbsp; <b>ACTION</b> fires the laser whenever
+the turret is locked on target</p>
+<script>
+let armed = false;
+
+function paint(s){
+  armed = !!s.armed;
+  const b = document.getElementById("arm");
+  b.textContent = armed ? "ACTION" : "SAFE";
+  b.className = armed ? "armed" : "";
+  const f = document.getElementById("fire");
+  f.textContent = s.firing ? "FIRING" : (armed ? "armed, waiting for lock"
+                                               : "output off");
+  f.className = "pill" + (s.firing ? " hot" : (s.on_target ? " live" : ""));
+  document.getElementById("pos").textContent =
+    "pan " + (s.pan ?? 0).toFixed(1) + "  tilt " + (s.tilt ?? 0).toFixed(1);
+}
+
+function toggleArm(){
+  // Deliberately no confirmation dialog - this is a toggle, and being asked
+  // "are you sure?" on every press makes it useless during a live demo.
+  fetch("/cmd?a=toggle_arm", {method: "POST"})
+    .then(r => r.json()).then(paint).catch(() => {});
+}
+
+function refresh(){
+  fetch("/state").then(r => r.json()).then(paint).catch(() => {});
+}
+setInterval(refresh, 600);
+refresh();
+</script>
 </body></html>"""
 
 
@@ -45,7 +90,40 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass                      # keep the console clear for the readout
 
+    def _json(self, obj, code=200):
+        import json as _json_mod
+        body = _json_mod.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        self._command()
+
+    def _command(self):
+        from urllib.parse import parse_qs, urlparse
+        q = parse_qs(urlparse(self.path).query)
+        action = (q.get("a") or [""])[0]
+        server = self.server.streamer
+        if action not in server.ALLOWED:
+            self._json({"error": "unknown command"}, 400)
+            return
+        # Queued, not acted on here: the control loop owns the hardware, so
+        # nothing touches the laser or the servos from an HTTP thread.
+        server.push_command(action)
+        self._json(server.state)
+
     def do_GET(self):
+        from urllib.parse import urlparse
+        path = urlparse(self.path).path
+        if path == "/cmd":
+            self._command()
+            return
+        if path == "/state":
+            self._json(self.server.streamer.state)
+            return
         if self.path in ("/", "/index.html"):
             body = PAGE.encode()
             self.send_response(200)
@@ -88,17 +166,39 @@ class _Handler(BaseHTTPRequestHandler):
 class MJPEGServer:
     """Publishes annotated frames to any browsers that are watching."""
 
+    ALLOWED = ("toggle_arm",)
+
     def __init__(self, port: int, quality: int = 70, max_fps: float = 15.0):
         self.port = port
         self.quality = int(quality)
         self.min_interval = 1.0 / max_fps if max_fps > 0 else 0.0
         self.encode_ms = 0.0
+        self._commands = []
+        self._cmd_lock = threading.Lock()
+        self.state = {"armed": False, "firing": False, "on_target": False,
+                      "pan": 0.0, "tilt": 0.0}
         self._jpg = None
         self._stamp = 0.0
         self._viewers = 0
         self._last_encode = 0.0
         self._cond = threading.Condition()
         self._httpd = None
+
+    # -- commands ------------------------------------------------------
+    def push_command(self, action: str) -> None:
+        with self._cmd_lock:
+            self._commands.append(action)
+
+    def take_commands(self) -> list:
+        """Drain pending commands. Costs nothing when empty."""
+        if not self._commands:
+            return []
+        with self._cmd_lock:
+            out, self._commands = self._commands, []
+        return out
+
+    def set_state(self, **fields) -> None:
+        self.state = fields
 
     # -- viewers -------------------------------------------------------
     def add_viewer(self) -> None:

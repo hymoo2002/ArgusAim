@@ -45,6 +45,9 @@ def banner(cfg: Config, camera, source, detector, streamer, turret=None) -> None
               % (turret.backend.name, turret.pan.gpio, turret.pan.min_deg,
                  turret.pan.max_deg, turret.pan.gain, turret.tilt.gpio,
                  turret.tilt.min_deg, turret.tilt.max_deg, turret.tilt.gain))
+        print("  laser    : %s   fires when ARMED and locked on target"
+              % turret.laser.backend)
+        print("             starts SAFE - press the button on the stream page")
         if turret.scan.enabled:
             span = turret.pan.max_deg - turret.pan.min_deg
             print("  no target: hold %.0fs, then sweep pan %+.0f..%+.0f at %.0f deg/s "
@@ -166,11 +169,22 @@ def run(cfg: Config) -> int:
             dt = now - last_tick
             last_tick = now
 
+            # --- web commands -----------------------------------------
+            # Drained here rather than acted on in the HTTP thread, so only the
+            # control loop ever touches the hardware.
+            if turret is not None and streamer is not None:
+                for action in streamer.take_commands():
+                    if action == "toggle_arm":
+                        state = "ACTION" if turret.toggle_arm() else "SAFE"
+                        note, note_until = state, now + 1.5
+                        print("  [arm] %s" % state)
+
             # --- move the mount ---------------------------------------
             # dt is measured first, because the control law needs it.
             if turret is not None and not paused:
                 turret.update(reading["yaw"] if reading else None,
-                              reading["pitch"] if reading else None, dt)
+                              reading["pitch"] if reading else None, dt,
+                              on_target=bool(reading and reading["on_target"]))
 
             if dt > 0:
                 # Smooth the frame *interval* and invert once, rather than
@@ -222,6 +236,12 @@ def run(cfg: Config) -> int:
                                        else "SEARCHING"))
 
             if streamer is not None:
+                if turret is not None:
+                    streamer.set_state(
+                        armed=turret.armed, firing=turret.firing,
+                        on_target=bool(reading and reading["on_target"]),
+                        pan=round(turret.pan_deg, 1),
+                        tilt=round(turret.tilt_deg, 1))
                 streamer.publish(view)
             if writer is not None:
                 writer.write(view)
