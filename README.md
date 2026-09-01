@@ -211,7 +211,7 @@ system Python, so everything lives in a virtual environment and `run` finds it.
 - **Every angle inherits any error in `--hfov`.** A 10% error there is a 10%
   error in every number reported.
 
-## Future work, insha'Allah
+## Future work
 
 - A depth sensor for true distance instead of an estimate
 - Smarter automatic choice of who to follow when several people are in frame
